@@ -42,6 +42,7 @@ PROCESSED_LABEL = "mto-processed"
 DEFAULT_SENDER = "andreina@engelsa.com"
 DEFAULT_CHANNEL = "C01V52LDVFW"          # #fb_purchase_es
 MATRIX_PATH = os.path.join(os.path.dirname(__file__), "..", "brand_matrix.csv")
+SHIPPING_PATH = os.path.join(os.path.dirname(__file__), "..", "shipping_costs.csv")
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 ATTACHMENT_EXTS = (".xlsx", ".xls", ".csv", ".eml")
 SUMMARY_TOP_N = 10
@@ -149,6 +150,7 @@ def run_analysis(items, skipped=0, sheet_report=None):
     res = core.analyze(items, os.environ["KEEPA_API_KEY"], params=params,
                        matrix_df=matrix_df, skip_hard_gated=True,
                        buybox=os.environ.get("KEEPA_BUYBOX", "1") == "1",
+                       shipping_path=SHIPPING_PATH,
                        progress=lambda m: print(f"  {m}"))
     res["skipped_rows"] = skipped
     res["sheet_report"] = sheet_report or {}

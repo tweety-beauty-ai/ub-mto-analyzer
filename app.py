@@ -28,6 +28,10 @@ APP_DIR = os.path.dirname(__file__)
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 CACHE_FILE = os.path.join(APP_DIR, "keepa_cache.json")
 MATRIX_FILE = os.path.join(APP_DIR, "brand_matrix.csv")
+# Per-EAN freight from the COGS Shipping Calculator sheet. Gitignored (internal
+# cost data, public repo) — absent on the cloud app, which then uses the flat
+# per-market rates and says so on the affected rows.
+SHIPPING_FILE = os.path.join(APP_DIR, "shipping_costs.csv")
 
 # Every key this UI reads, with literal fallbacks. Declared here (not derived
 # from core) so the page still renders if core.py is an older/newer revision
@@ -96,6 +100,11 @@ def get_keepa_key():
     return st.session_state.get("keepa_key", "")
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_shipping_table():
+    return core.load_shipping_table(SHIPPING_FILE)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_matrix_df():
     return pd.read_csv(MATRIX_FILE, dtype=str).fillna("")
@@ -116,6 +125,9 @@ with st.sidebar:
                         min_value=0, max_value=168, step=1, key="cache_hours")
         st.checkbox("Skip Keepa lookups for hard-gated markets (saves tokens)",
                     value=bool(cfg["skip_hard_gated"]), key="skip_hard_gated")
+        _n_ship = len(load_shipping_table())
+        st.caption(f"Per-EAN freight: **{_n_ship} rows loaded**" if _n_ship
+                   else "Per-EAN freight: not loaded — flat market rates in use")
         st.checkbox("Request Buy Box prices (3 tokens/product instead of 1)",
                     value=bool(cfg.get("buybox", True)), key="buybox",
                     help="Buy Box is the accurate sell-price proxy. Off = cheaper, "
@@ -349,6 +361,7 @@ if st.button("🔍 Fetch from Keepa & Analyze", type="primary"):
                 progress=lambda msg: status.update(label=msg),
                 skip_hard_gated=st.session_state.get("skip_hard_gated", True),
                 buybox=st.session_state.get("buybox", True),
+                shipping_path=SHIPPING_FILE,
             )
         except (requests.HTTPError, RuntimeError) as e:
             st.error(f"Keepa error: {e} — check your API key and token balance.")
@@ -370,9 +383,10 @@ if st.session_state.get("tokens_left") is not None:
 
 # Re-built on every rerun so sidebar parameter changes update ROI instantly
 P = effective_params()
+_ship = load_shipping_table()
 result_df = core.build_result_df(items, st.session_state["market_data"],
                                  core.matrix_from_df(matrix_df), P,
-                                 st.session_state.get("skipped_pairs"))
+                                 st.session_state.get("skipped_pairs"), _ship)
 
 for _line in core.status_summary_lines(result_df):
     st.markdown(f"#### {_line}")

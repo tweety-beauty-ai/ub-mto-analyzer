@@ -158,14 +158,14 @@ MARKETS = {
     # price_divisor: Keepa returns prices in the currency's smallest unit —
     # cents for GBP/CAD (÷100), but JPY has no minor unit so values are whole yen.
     "CA": {"domain": 6, "currency": "CAD", "calc": calc_ca, "price_divisor": 100,
-           "fba_key": "ca_fba"},
+           "fba_key": "ca_fba", "ship_key": "ca_ship"},
     "UK": {"domain": 2, "currency": "GBP", "calc": calc_uk, "price_divisor": 100,
-           "fba_key": "uk_fba"},
+           "fba_key": "uk_fba", "ship_key": "uk_ship"},
     # JP has no fba_key: its fulfilment sits inside the all-in additional cost,
     # so Keepa's JP FBA fee must NOT be added on top.
     "JP": {"domain": 5, "currency": "JPY", "calc": calc_jp, "price_divisor": 1},
     "US": {"domain": 1, "currency": "USD", "calc": calc_us, "price_divisor": 100,
-           "fba_key": "us_fba"},
+           "fba_key": "us_fba", "ship_key": "us_ship"},
 }
 KEEPA_DOMAINS = {m: cfg["domain"] for m, cfg in MARKETS.items()}
 
@@ -235,6 +235,38 @@ def gating_for_brand(matrix, brand):
         if len(key) >= 4 and len(nb) >= 4 and (key in nb or nb in key):
             return entry
     return None
+
+
+# ─── PER-EAN FREIGHT (from the COGS Shipping Calculator sheet) ────────────────
+# The flat per-market shipping parameters are averages; real freight per unit
+# ranges widely (US: 0.64–7.26 EUR), which is the single biggest reason a
+# modeled COGS drifts from Seller Snap's actual. When a freight table is
+# available, the product's own cost is used instead of the flat rate.
+#
+# Source of truth: the "COGS Shipping Calculator" Google Sheet, Output tab
+# (90-day weighted average, refreshed daily). Its market codes differ from ours.
+
+SHIPPING_MARKET_ALIASES = {"USA": "US", "US": "US", "CA": "CA", "UK": "UK",
+                           "AU": "AU", "WM": "WM"}
+
+
+def load_shipping_table(path):
+    """{(ean, market): eur_per_unit} from a csv with ean,market,cost_per_unit_eur.
+    Returns {} when the file is absent — callers then use the flat rates."""
+    if not path or not os.path.exists(path):
+        return {}
+    table = {}
+    try:
+        df = pd.read_csv(path, dtype={"ean": str})
+    except Exception:
+        return {}
+    for _, r in df.iterrows():
+        ean = normalize_ean(r.get("ean"))
+        market = SHIPPING_MARKET_ALIASES.get(str(r.get("market", "")).strip().upper())
+        cost = pd.to_numeric(r.get("cost_per_unit_eur"), errors="coerce")
+        if ean and market and pd.notna(cost) and cost >= 0:
+            table[(ean, market)] = float(cost)
+    return table
 
 
 # ─── KEEPA CLIENT ─────────────────────────────────────────────────────────────
@@ -628,10 +660,12 @@ RESULT_COLUMNS = (["Product", "Brand", "EAN", "Purchase (EUR)", "Status"]
                   + ["Notes"])
 
 
-def build_result_df(items, market_data, matrix, params, skipped_pairs=None):
+def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
+                    shipping_table=None):
     """Assemble + rank the result table. Pure function of its inputs, so the UI
     can re-rank with new params without re-fetching."""
     skipped_pairs = skipped_pairs or set()
+    shipping_table = shipping_table or {}
     P = {**DEFAULT_PARAMS, **(params or {})}
     rows = []
     for it in items:
@@ -699,6 +733,15 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None):
                     P_market = {**P, fba_key: d["fba_fee"]}
                 elif fba_key and d:
                     notes.append(f"{market}: FBA fee is the flat default")
+                # this product's own freight beats the market average
+                ship_key = cfg.get("ship_key")
+                if ship_key:
+                    real_ship = shipping_table.get((it["ean"], market))
+                    if real_ship is not None:
+                        P_market = {**P_market, ship_key: real_ship}
+                    elif shipping_table:
+                        notes.append(f"{market}: freight is the flat default "
+                                     f"({P[ship_key]:.2f} EUR)")
                 roi = round(calc(it["price_eur"], sell, P_market, is_dg) * 100, 1)
             row[f"ASIN {market}"] = asin
             row[f"Sell {market} ({cur})"] = round(sell, 2) if sell is not None else None
@@ -742,7 +785,8 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None):
 
 
 def analyze(items, keepa_key, params=None, matrix_df=None, cache_path=None,
-            cache_hours=24, progress=None, skip_hard_gated=True, buybox=True):
+            cache_hours=24, progress=None, skip_hard_gated=True, buybox=True,
+            shipping_path=None):
     """End-to-end: gating pre-check → Keepa fetch → ranked result table.
 
     Returns dict with result_df, market_data, skipped_pairs, tokens_left,
@@ -757,7 +801,10 @@ def analyze(items, keepa_key, params=None, matrix_df=None, cache_path=None,
                                                cache_hours, progress, cache_path, buybox)
         if tl is not None:
             tokens_left = tl
-    result_df = build_result_df(items, market_data, matrix, params, skipped_pairs)
+    shipping_table = load_shipping_table(shipping_path)
+    result_df = build_result_df(items, market_data, matrix, params, skipped_pairs,
+                                shipping_table)
     return {"result_df": result_df, "market_data": market_data,
             "skipped_pairs": skipped_pairs, "tokens_left": tokens_left,
-            "fetched": {m: len(e) for m, e in plan.items()}}
+            "fetched": {m: len(e) for m, e in plan.items()},
+            "shipping_rows": len(shipping_table)}

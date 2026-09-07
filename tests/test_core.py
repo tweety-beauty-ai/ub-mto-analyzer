@@ -418,6 +418,52 @@ def test_reheader_finds_header_row():
     assert len(items) == 1 and items[0]["price_eur"] == 54.95   # comma price parsed
 
 
+# ─── Per-EAN freight ─────────────────────────────────────────────────────────
+
+def test_load_shipping_table():
+    import tempfile
+    path = os.path.join(tempfile.mkdtemp(), "ship.csv")
+    with open(path, "w") as f:
+        f.write("ean,market,cost_per_unit_eur\n"
+                "8435137743179,USA,4.0133\n"        # sheet calls the US 'USA'
+                "685428001534,CA,2.10\n"             # 12-digit UPC, leading zero dropped by the sheet
+                "3614273790840,AU,6.27\n"
+                "bad,US,1.00\n"                      # unusable EAN
+                "1234567890123,US,\n")               # missing cost
+    t = core.load_shipping_table(path)
+    assert t[("8435137743179", "US")] == 4.0133      # USA -> US alias
+    assert t[("0685428001534", "CA")] == 2.10        # padded to 13 digits
+    assert ("bad", "US") not in t and len(t) == 3
+    assert core.load_shipping_table("/nonexistent.csv") == {}   # optional file
+
+
+def test_per_ean_freight_beats_flat_rate():
+    m = core.matrix_from_df(pd.DataFrame({"Brand": ["Prada"], "US": ["ok"], "CA": ["ok"],
+                                          "UK": ["ok"], "AU": [""], "JP": [""], "Notes": [""]}))
+    items = [{"ean": "8435137743179", "title": "Prada EDP", "price_eur": 109.87, "brand": "Prada"}]
+    md = {"US": {"8435137743179": {"asin": "A", "title": "t", "brand": "Prada", "eans": [],
+                                    "buybox90": 234.94, "new90": None, "rank30": 900,
+                                    "fba_fee": 6.11}}}
+    p = {**P, "eur_usd": 1.1617}
+    flat = core.build_result_df(items, md, m, p).iloc[0]
+    real = core.build_result_df(items, md, m, p, None,
+                                {("8435137743179", "US"): 4.0133}).iloc[0]
+    # real freight (4.01) exceeds the 3.34 flat, so COGS rises and ROI falls
+    assert real["ROI US"] < flat["ROI US"]
+    assert abs(real["ROI US"] - 29.9) < 0.1        # Seller Snap reports 29.85%
+    assert "freight is the flat default" not in (real["Notes"] or "")
+
+
+def test_freight_note_when_ean_missing_from_table():
+    m = core.matrix_from_df(pd.DataFrame({"Brand": ["Prada"], "US": ["ok"], "CA": ["ok"],
+                                          "UK": ["ok"], "AU": [""], "JP": [""], "Notes": [""]}))
+    items = [{"ean": "9999999999999", "title": "X", "price_eur": 50.0, "brand": "Prada"}]
+    md = {"US": {"9999999999999": {"asin": "A", "title": "t", "brand": "Prada", "eans": [],
+                                    "buybox90": 100.0, "new90": None, "rank30": 1, "fba_fee": 5.0}}}
+    r = core.build_result_df(items, md, m, P, None, {("other", "US"): 1.0}).iloc[0]
+    assert "US: freight is the flat default" in r["Notes"]
+
+
 # ─── Cache pruning ────────────────────────────────────────────────────────────
 
 def test_cache_prune(tmp_path=None):
