@@ -29,6 +29,7 @@ Local test (no Gmail/Slack touched):
 import argparse
 import base64
 import io
+import json
 import os
 import sys
 
@@ -135,6 +136,19 @@ def parse_offer_file(filename, data, default_brand=""):
     return core.items_from_excel(data, default_brand)
 
 
+def _shipping_creds():
+    """Service-account JSON for the live freight sheet, from the env
+    (GCP_SERVICE_ACCOUNT_JSON, inline or a path) or ~/.config."""
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "")
+    if raw.strip().startswith("{"):
+        return json.loads(raw)
+    for path in (raw, os.path.expanduser("~/.config/mto-analyzer-sa.json")):
+        if path and os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    return None
+
+
 def run_analysis(items, skipped=0, sheet_report=None):
     if not items:
         raise ValueError("No valid rows found (need EAN + purchase price per row).")
@@ -151,6 +165,7 @@ def run_analysis(items, skipped=0, sheet_report=None):
                        matrix_df=matrix_df, skip_hard_gated=True,
                        buybox=os.environ.get("KEEPA_BUYBOX", "1") == "1",
                        shipping_path=SHIPPING_PATH,
+                       shipping_creds=_shipping_creds(),
                        progress=lambda m: print(f"  {m}"))
     res["skipped_rows"] = skipped
     res["sheet_report"] = sheet_report or {}

@@ -249,6 +249,56 @@ def gating_for_brand(matrix, brand):
 SHIPPING_MARKET_ALIASES = {"USA": "US", "US": "US", "CA": "CA", "UK": "UK",
                            "AU": "AU", "WM": "WM"}
 
+# "COGS Shipping Calculator" — refreshed daily by finance's Apps Script.
+# Output = 90-day weighted average shipping; Output_Customs is a different
+# thing (180-day customs) and must not be used here.
+SHIPPING_SHEET_ID = "15-xKszQNrnbsfEf_zqMkjtac7SUuo8-hmD-J1SW4azs"
+SHIPPING_SHEET_RANGE = "Output!A2:D"      # EAN | Market | Product | Avg Cost per Unit EUR
+
+
+def fetch_shipping_sheet(creds_info, sheet_id=SHIPPING_SHEET_ID,
+                         rng=SHIPPING_SHEET_RANGE):
+    """Live per-EAN freight straight from the sheet, via a read-only service
+    account. `creds_info` is the service-account JSON as a dict. Raises on
+    failure so the caller can fall back to the CSV/flat rates."""
+    from google.oauth2 import service_account            # optional dependency
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_info(
+        dict(creds_info), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    rows = svc.spreadsheets().values().get(
+        spreadsheetId=sheet_id, range=rng).execute().get("values", [])
+    table = {}
+    for row in rows:
+        if len(row) < 4:
+            continue
+        ean = normalize_ean(row[0])
+        market = SHIPPING_MARKET_ALIASES.get(str(row[1]).strip().upper())
+        cost = pd.to_numeric(str(row[3]).replace(",", "."), errors="coerce")
+        if ean and market and pd.notna(cost) and cost >= 0:
+            table[(ean, market)] = float(cost)
+    return table
+
+
+def resolve_shipping_table(creds_info=None, csv_path=None):
+    """(table, source) — live sheet first, then a local CSV, then nothing.
+    Never raises: an unreachable sheet degrades to the CSV or the flat rates."""
+    if creds_info:
+        try:
+            table = fetch_shipping_sheet(creds_info)
+            if table:
+                return table, f"live sheet ({len(table)} rows)"
+        except Exception as e:
+            csv_table = load_shipping_table(csv_path)
+            if csv_table:
+                return csv_table, f"local CSV ({len(csv_table)} rows) — sheet unreachable: {e}"
+            return {}, f"flat rates — sheet unreachable: {e}"
+    table = load_shipping_table(csv_path)
+    if table:
+        return table, f"local CSV ({len(table)} rows)"
+    return {}, "flat rates (no freight data)"
+
 
 def load_shipping_table(path):
     """{(ean, market): eur_per_unit} from a csv with ean,market,cost_per_unit_eur.
@@ -786,7 +836,7 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
 
 def analyze(items, keepa_key, params=None, matrix_df=None, cache_path=None,
             cache_hours=24, progress=None, skip_hard_gated=True, buybox=True,
-            shipping_path=None):
+            shipping_path=None, shipping_creds=None):
     """End-to-end: gating pre-check → Keepa fetch → ranked result table.
 
     Returns dict with result_df, market_data, skipped_pairs, tokens_left,
@@ -801,10 +851,11 @@ def analyze(items, keepa_key, params=None, matrix_df=None, cache_path=None,
                                                cache_hours, progress, cache_path, buybox)
         if tl is not None:
             tokens_left = tl
-    shipping_table = load_shipping_table(shipping_path)
+    shipping_table, shipping_source = resolve_shipping_table(shipping_creds, shipping_path)
+    progress(f"freight: {shipping_source}")
     result_df = build_result_df(items, market_data, matrix, params, skipped_pairs,
                                 shipping_table)
     return {"result_df": result_df, "market_data": market_data,
             "skipped_pairs": skipped_pairs, "tokens_left": tokens_left,
             "fetched": {m: len(e) for m, e in plan.items()},
-            "shipping_rows": len(shipping_table)}
+            "shipping_rows": len(shipping_table), "shipping_source": shipping_source}

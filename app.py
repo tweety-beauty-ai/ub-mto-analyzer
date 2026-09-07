@@ -100,9 +100,25 @@ def get_keepa_key():
     return st.session_state.get("keepa_key", "")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+def shipping_creds():
+    """Service-account JSON from Streamlit secrets (cloud) or a local file."""
+    try:
+        if "gcp_service_account" in st.secrets:
+            return dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+    local = os.path.expanduser("~/.config/mto-analyzer-sa.json")
+    if os.path.exists(local):
+        with open(local) as f:
+            return json.load(f)
+    return None
+
+
+@st.cache_data(ttl=21600, show_spinner=False)      # 6h — the sheet refreshes daily
 def load_shipping_table():
-    return core.load_shipping_table(SHIPPING_FILE)
+    """(table, source). Live sheet when credentials exist, else local CSV,
+    else flat rates."""
+    return core.resolve_shipping_table(shipping_creds(), SHIPPING_FILE)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -125,9 +141,8 @@ with st.sidebar:
                         min_value=0, max_value=168, step=1, key="cache_hours")
         st.checkbox("Skip Keepa lookups for hard-gated markets (saves tokens)",
                     value=bool(cfg["skip_hard_gated"]), key="skip_hard_gated")
-        _n_ship = len(load_shipping_table())
-        st.caption(f"Per-EAN freight: **{_n_ship} rows loaded**" if _n_ship
-                   else "Per-EAN freight: not loaded — flat market rates in use")
+        _ship_tbl, _ship_src = load_shipping_table()
+        st.caption(f"Per-EAN freight: **{_ship_src}**")
         st.checkbox("Request Buy Box prices (3 tokens/product instead of 1)",
                     value=bool(cfg.get("buybox", True)), key="buybox",
                     help="Buy Box is the accurate sell-price proxy. Off = cheaper, "
@@ -362,6 +377,7 @@ if st.button("🔍 Fetch from Keepa & Analyze", type="primary"):
                 skip_hard_gated=st.session_state.get("skip_hard_gated", True),
                 buybox=st.session_state.get("buybox", True),
                 shipping_path=SHIPPING_FILE,
+                shipping_creds=shipping_creds(),
             )
         except (requests.HTTPError, RuntimeError) as e:
             st.error(f"Keepa error: {e} — check your API key and token balance.")
@@ -383,7 +399,7 @@ if st.session_state.get("tokens_left") is not None:
 
 # Re-built on every rerun so sidebar parameter changes update ROI instantly
 P = effective_params()
-_ship = load_shipping_table()
+_ship, _ship_source = load_shipping_table()
 result_df = core.build_result_df(items, st.session_state["market_data"],
                                  core.matrix_from_df(matrix_df), P,
                                  st.session_state.get("skipped_pairs"), _ship)
@@ -393,7 +409,8 @@ for _line in core.status_summary_lines(result_df):
 
 n_found = result_df[[f"ROI {m}" for m in core.MARKETS]].notna().any(axis=1).sum()
 st.markdown(f"**{len(result_df)} products** ({n_found} found on Keepa) — "
-            f"sellable brands first, then by ROI CA → UK → JP · rates: {P['_rates_source']}")
+            f"sellable brands first, then by ROI CA → UK → JP → US · "
+            f"rates: {P['_rates_source']} · freight: {_ship_source}")
 
 display_df = result_df.copy()
 for _m in core.MARKETS:

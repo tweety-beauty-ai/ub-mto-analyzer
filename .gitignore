@@ -1,1 +1,6 @@
 shipping_costs.csv
+
+# service-account keys must never be committed
+*sa.json
+*service-account*.json
+mto-analyzer-*.json
