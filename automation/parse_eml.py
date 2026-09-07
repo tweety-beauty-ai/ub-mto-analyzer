@@ -44,15 +44,18 @@ def brand_from_subject(subject):
     s = re.sub(r"\*+", "", s)
     s = re.split(r"\s*[-–|]\s*", s)[0]
     s = re.sub(r"\b(news|offer|oferta|new|nuevo|stock|promo|mto|top seller|"
-               r"made to order|price list|pricelist)\b", "", s, flags=re.I)
-    return re.sub(r"\s{2,}", " ", s).strip(" .:,-")
+               r"made to order|price list|pricelist|pre|order|preorder|"
+               r"sale|liquidation)\b", "", s, flags=re.I)
+    s = re.sub(r"\s{2,}", " ", s).strip(" .:,-")
+    # drop a dangling conjunction left behind by the noise-word removal
+    return re.sub(r"^[&+/]\s*|\s*[&+/]$", "", s).strip(" .:,-")
 
 
 def offer_terms(text):
     """Offer conditions, one per keyword. Each term runs from its keyword to the
     next one, so 'MOQ: 12 PCS/REF. DELIVERY: 6-8 WEEKS' yields two clean terms
     instead of one long overlapping blob."""
-    flat = re.sub(r"\s+", " ", text or "")
+    flat = re.sub(r"\s+", " ", re.sub(r"\*+", " ", text or ""))
     hits = sorted((m.start(), kw) for kw in TERM_KEYWORDS
                   for m in re.finditer(re.escape(kw), flat, flags=re.I))
     terms = []
