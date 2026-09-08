@@ -116,8 +116,8 @@ def shipping_creds():
 
 @st.cache_data(ttl=21600, show_spinner=False)      # 6h — the sheet refreshes daily
 def load_shipping_table():
-    """(table, source). Live sheet when credentials exist, else local CSV,
-    else flat rates."""
+    """(freight, customs, source). Live sheet when credentials exist, else the
+    local CSV, else flat rates."""
     return core.resolve_shipping_table(shipping_creds(), SHIPPING_FILE)
 
 
@@ -141,7 +141,7 @@ with st.sidebar:
                         min_value=0, max_value=168, step=1, key="cache_hours")
         st.checkbox("Skip Keepa lookups for hard-gated markets (saves tokens)",
                     value=bool(cfg["skip_hard_gated"]), key="skip_hard_gated")
-        _ship_tbl, _ship_src = load_shipping_table()
+        _ship_tbl, _cust_tbl, _ship_src = load_shipping_table()
         st.caption(f"Per-EAN freight: **{_ship_src}**")
         st.checkbox("Request Buy Box prices (3 tokens/product instead of 1)",
                     value=bool(cfg.get("buybox", True)), key="buybox",
@@ -399,10 +399,10 @@ if st.session_state.get("tokens_left") is not None:
 
 # Re-built on every rerun so sidebar parameter changes update ROI instantly
 P = effective_params()
-_ship, _ship_source = load_shipping_table()
+_ship, _cust, _ship_source = load_shipping_table()
 result_df = core.build_result_df(items, st.session_state["market_data"],
                                  core.matrix_from_df(matrix_df), P,
-                                 st.session_state.get("skipped_pairs"), _ship)
+                                 st.session_state.get("skipped_pairs"), _ship, _cust)
 
 for _line in core.status_summary_lines(result_df):
     st.markdown(f"#### {_line}")

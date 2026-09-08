@@ -454,6 +454,23 @@ def test_per_ean_freight_beats_flat_rate():
     assert "freight is the flat default" not in (real["Notes"] or "")
 
 
+def test_customs_clearance_added_to_cogs():
+    """The sheet's per-EAN customs clearance is a real cash cost neither tool
+    modelled; it lowers ROI slightly and is not itself dutiable."""
+    p = {**P, "eur_usd": 1.1622, "us_ship": 4.0133, "us_fba": 6.11}
+    without = core.calc_us(109.87, 214.95, p) * 100
+    with_c = core.calc_us(109.87, 214.95, {**p, "us_customs": 0.4982}) * 100
+    assert with_c < without
+    assert abs(with_c - 17.95) < 0.05        # Seller Snap reports 17.61%
+    for k in ("us_customs", "uk_customs", "ca_customs"):
+        assert core.DEFAULT_PARAMS[k] == 0.0   # off unless looked up
+
+
+def test_resolve_returns_freight_customs_and_source():
+    f, c, src = core.resolve_shipping_table(None, "/nonexistent.csv")
+    assert f == {} and c == {} and "flat rates" in src
+
+
 def test_freight_note_when_ean_missing_from_table():
     m = core.matrix_from_df(pd.DataFrame({"Brand": ["Prada"], "US": ["ok"], "CA": ["ok"],
                                           "UK": ["ok"], "AU": [""], "JP": [""], "Notes": [""]}))

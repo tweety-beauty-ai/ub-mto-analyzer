@@ -30,6 +30,8 @@ DEFAULT_PARAMS = {
     # toolkit's costs.cogs_local(); tariff is ad-valorem on goods + shipping.
     "us_ship": 3.34, "us_add": 2.35, "us_tariff": 10.0,
     "us_fba": 5.43, "us_ref": 15.0,
+    # actual customs clearance per unit (from the sheet; 0 unless looked up)
+    "us_customs": 0.0, "uk_customs": 0.0, "ca_customs": 0.0,
     # Japan: one all-in additional cost per unit (shipping/3PL/FBA/duties),
     # split by dangerous goods (alcohol-based: EDT/EDP/perfume) vs not.
     "jp_add_dg": 35.32, "jp_add_ndg": 20.21,
@@ -93,7 +95,7 @@ def calc_uk(p_eur, s_gbp, P, is_dg=True):
     ~1pp higher than this one until that is changed. Set uk_dsf=0 to match it.
     """
     rate = P["eur_gbp"]
-    cogs = (p_eur + P["uk_ship"] + P["uk_lab"]) * rate
+    cogs = (p_eur + P["uk_ship"] + P["uk_lab"] + P.get("uk_customs", 0.0)) * rate
     s    = s_gbp / (1 + P["uk_vat"] / 100)
     ref  = s * P["uk_ref"] / 100
     dsf  = (ref + P["uk_fba"]) * P.get("dsf", 0.0) / 100
@@ -104,7 +106,7 @@ def calc_uk(p_eur, s_gbp, P, is_dg=True):
 def calc_ca(p_eur, s_cad, P, is_dg=True):
     """ROI for CA, computed in USD. DSF applies to referral + FBA fees."""
     cad_usd  = 1 / P["usd_cad"]
-    cogs     = (p_eur + P["ca_ship"] + P["ca_lab"]) * P["eur_usd"]
+    cogs     = (p_eur + P["ca_ship"] + P["ca_lab"] + P.get("ca_customs", 0.0)) * P["eur_usd"]
     sell_usd = s_cad * cad_usd
     fba_usd  = P["ca_fba"] * cad_usd
     ref      = sell_usd * P["ca_ref"] / 100
@@ -127,7 +129,7 @@ def calc_us(p_eur, s_usd, P, is_dg=True):
     basis turns out to be the correct one everywhere, those two should change too.
     """
     cogs = ((p_eur + P["us_ship"]) * (1 + P["us_tariff"] / 100)
-            + P["us_add"]) * P["eur_usd"]
+            + P["us_add"] + P.get("us_customs", 0.0)) * P["eur_usd"]
     ref = s_usd * P["us_ref"] / 100
     dsf = ref * P.get("dsf", 0.0) / 100
     ppu = s_usd - cogs - ref - dsf - P["us_fba"]
@@ -158,14 +160,17 @@ MARKETS = {
     # price_divisor: Keepa returns prices in the currency's smallest unit —
     # cents for GBP/CAD (÷100), but JPY has no minor unit so values are whole yen.
     "CA": {"domain": 6, "currency": "CAD", "calc": calc_ca, "price_divisor": 100,
-           "fba_key": "ca_fba", "ship_key": "ca_ship"},
+           "fba_key": "ca_fba", "ship_key": "ca_ship",
+           "customs_key": "ca_customs"},
     "UK": {"domain": 2, "currency": "GBP", "calc": calc_uk, "price_divisor": 100,
-           "fba_key": "uk_fba", "ship_key": "uk_ship"},
+           "fba_key": "uk_fba", "ship_key": "uk_ship",
+           "customs_key": "uk_customs"},
     # JP has no fba_key: its fulfilment sits inside the all-in additional cost,
     # so Keepa's JP FBA fee must NOT be added on top.
     "JP": {"domain": 5, "currency": "JPY", "calc": calc_jp, "price_divisor": 1},
     "US": {"domain": 1, "currency": "USD", "calc": calc_us, "price_divisor": 100,
-           "fba_key": "us_fba", "ship_key": "us_ship"},
+           "fba_key": "us_fba", "ship_key": "us_ship",
+           "customs_key": "us_customs"},
 }
 KEEPA_DOMAINS = {m: cfg["domain"] for m, cfg in MARKETS.items()}
 
@@ -254,6 +259,7 @@ SHIPPING_MARKET_ALIASES = {"USA": "US", "US": "US", "CA": "CA", "UK": "UK",
 # thing (180-day customs) and must not be used here.
 SHIPPING_SHEET_ID = "15-xKszQNrnbsfEf_zqMkjtac7SUuo8-hmD-J1SW4azs"
 SHIPPING_SHEET_RANGE = "Output!A2:D"      # EAN | Market | Product | Avg Cost per Unit EUR
+CUSTOMS_SHEET_RANGE = "Output_Customs!A2:D"   # same shape, customs clearance per unit
 
 
 def fetch_shipping_sheet(creds_info, sheet_id=SHIPPING_SHEET_ID,
@@ -282,22 +288,28 @@ def fetch_shipping_sheet(creds_info, sheet_id=SHIPPING_SHEET_ID,
 
 
 def resolve_shipping_table(creds_info=None, csv_path=None):
-    """(table, source) — live sheet first, then a local CSV, then nothing.
-    Never raises: an unreachable sheet degrades to the CSV or the flat rates."""
+    """(freight, customs, source) — live sheet first, then a local CSV, then
+    nothing. Never raises: an unreachable sheet degrades to CSV or flat rates."""
     if creds_info:
         try:
             table = fetch_shipping_sheet(creds_info)
+            customs = {}
+            try:
+                customs = fetch_shipping_sheet(creds_info, rng=CUSTOMS_SHEET_RANGE)
+            except Exception:
+                pass          # customs is a bonus; freight alone is still useful
             if table:
-                return table, f"live sheet ({len(table)} rows)"
+                return table, customs, (f"live sheet ({len(table)} freight / "
+                                        f"{len(customs)} customs rows)")
         except Exception as e:
             csv_table = load_shipping_table(csv_path)
             if csv_table:
-                return csv_table, f"local CSV ({len(csv_table)} rows) — sheet unreachable: {e}"
-            return {}, f"flat rates — sheet unreachable: {e}"
+                return csv_table, {}, f"local CSV ({len(csv_table)} rows) — sheet unreachable: {e}"
+            return {}, {}, f"flat rates — sheet unreachable: {e}"
     table = load_shipping_table(csv_path)
     if table:
-        return table, f"local CSV ({len(table)} rows)"
-    return {}, "flat rates (no freight data)"
+        return table, {}, f"local CSV ({len(table)} rows)"
+    return {}, {}, "flat rates (no freight data)"
 
 
 def load_shipping_table(path):
@@ -711,11 +723,12 @@ RESULT_COLUMNS = (["Product", "Brand", "EAN", "Purchase (EUR)", "Status"]
 
 
 def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
-                    shipping_table=None):
+                    shipping_table=None, customs_table=None):
     """Assemble + rank the result table. Pure function of its inputs, so the UI
     can re-rank with new params without re-fetching."""
     skipped_pairs = skipped_pairs or set()
     shipping_table = shipping_table or {}
+    customs_table = customs_table or {}
     P = {**DEFAULT_PARAMS, **(params or {})}
     rows = []
     for it in items:
@@ -792,6 +805,11 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
                     elif shipping_table:
                         notes.append(f"{market}: freight is the flat default "
                                      f"({P[ship_key]:.2f} EUR)")
+                customs_key = cfg.get("customs_key")
+                if customs_key:
+                    real_customs = customs_table.get((it["ean"], market))
+                    if real_customs:
+                        P_market = {**P_market, customs_key: real_customs}
                 roi = round(calc(it["price_eur"], sell, P_market, is_dg) * 100, 1)
             row[f"ASIN {market}"] = asin
             row[f"Sell {market} ({cur})"] = round(sell, 2) if sell is not None else None
@@ -851,10 +869,11 @@ def analyze(items, keepa_key, params=None, matrix_df=None, cache_path=None,
                                                cache_hours, progress, cache_path, buybox)
         if tl is not None:
             tokens_left = tl
-    shipping_table, shipping_source = resolve_shipping_table(shipping_creds, shipping_path)
+    shipping_table, customs_table, shipping_source = resolve_shipping_table(
+        shipping_creds, shipping_path)
     progress(f"freight: {shipping_source}")
     result_df = build_result_df(items, market_data, matrix, params, skipped_pairs,
-                                shipping_table)
+                                shipping_table, customs_table)
     return {"result_df": result_df, "market_data": market_data,
             "skipped_pairs": skipped_pairs, "tokens_left": tokens_left,
             "fetched": {m: len(e) for m, e in plan.items()},
