@@ -38,7 +38,8 @@ DEFAULT_PARAMS = {
     "jp_ref": 10.4, "jp_dsf": 2.5, "jp_vat": 10.0,
 }
 
-RATES_URL = "https://api.frankfurter.app/latest?from=EUR&to=GBP,USD,CAD,JPY"
+# frankfurter.app now 301-redirects here; call the new host directly.
+RATES_URL = "https://api.frankfurter.dev/v1/latest?base=EUR&symbols=GBP,USD,CAD,JPY"
 
 
 def fetch_live_rates(timeout=8):
@@ -185,17 +186,21 @@ def fmt_roi(val):
 # ─── BRAND GATING ─────────────────────────────────────────────────────────────
 
 MATRIX_MARKETS = ["US", "CA", "UK", "AU", "JP"]
-STATUS_OPTIONS = ["", "ok", "has path to apply", "Hard Gated"]
+STATUS_OPTIONS = ["", "ok", "has path to apply", "Hard Gated", "do not sell"]
 
 GATE_OK, GATE_APPLY, GATE_CHECK, GATE_HARD = 0, 1, 2, 3
 GATE_LABELS = {GATE_OK: "✅ OK", GATE_APPLY: "🟠 Gated — can apply",
                GATE_CHECK: "❓ To be checked", GATE_HARD: "🚫 Hard gated"}
 GATE_UNKNOWN = "❓ Gating status to be checked"
+GATE_NO_SELL_LABEL = "🚫 we do not sell this brand"
 
 
 def classify_gating(text):
+    """'do not sell' is our own decision (import complexity, brand policy)
+    rather than an Amazon gate, but it excludes the brand just as firmly — the
+    reason belongs in the Notes column."""
     tl = str(text).strip().lower() if text is not None else ""
-    if "hard" in tl:
+    if "hard" in tl or "do not sell" in tl or "not sold" in tl or "dont sell" in tl:
         return GATE_HARD
     if tl in ("ok", "ungated") or tl.startswith("ungated"):
         return GATE_OK
@@ -220,9 +225,41 @@ def matrix_from_df(df):
             continue
         entry = {"display": brand, "note": str(r.get("Notes", "")).strip()}
         for market in MATRIX_MARKETS:
+            raw = str(r.get(market, "") or "").lower()
             entry[market] = classify_gating(r.get(market, ""))
+            # excluded by our own decision, not by Amazon — say which
+            if "sell" in raw and ("not" in raw or "dont" in raw):
+                entry[f"{market}_label"] = GATE_NO_SELL_LABEL
         matrix[norm_brand(brand)] = entry
     return matrix
+
+
+def brand_from_title(title, matrix):
+    """Supplier titles lead with the brand ('ABERCROMBIE & FITCH AWAY WEEKEND
+    ... EDP 100 ML'). When a title starts with a brand we know, that beats
+    whatever brand the offer line carried — big multi-brand offers often label
+    every row with the offer's own name, which would make gating meaningless.
+    Returns the matrix's own spelling, or None when there is no confident match."""
+    t = norm_brand(title)
+    if not t:
+        return None
+    best = None
+    for key, entry in matrix.items():          # longest match wins
+        if len(key) >= 4 and t.startswith(key) and (best is None or len(key) > len(best[0])):
+            best = (key, entry["display"])
+    return best[1] if best else None
+
+
+def infer_brands(items, matrix):
+    """Fill in each item's brand from its title where the title names a brand we
+    know. Returns how many were changed."""
+    changed = 0
+    for it in items:
+        found = brand_from_title(it.get("title", ""), matrix)
+        if found and norm_brand(found) != norm_brand(it.get("brand") or ""):
+            it["brand"] = found
+            changed += 1
+    return changed
 
 
 def gating_for_brand(matrix, brand):
@@ -312,6 +349,238 @@ def resolve_shipping_table(creds_info=None, csv_path=None):
     return {}, {}, "flat rates (no freight data)"
 
 
+# ─── BRAND GATING MATRIX ──────────────────────────────────────────────────────
+# "Amazon Global Selling Restrictions & Approvals", tab "brand selling
+# approval" — maintained by the listing team. The status lives in the cell
+# COLOUR, not the text: an empty orange cell means "gated, can apply", and the
+# text in those cells is usually the reference ASIN to apply with. So we read
+# the formatting, not just the values.
+BRAND_SHEET_ID = "1aJbNQ71fUffSAR54kf6eokShWdkY2FrSk2x7DCdwtHE"
+BRAND_SHEET_TAB = "brand selling approval"
+BRAND_SHEET_URL = (f"https://docs.google.com/spreadsheets/d/{BRAND_SHEET_ID}"
+                   "/edit?gid=576947683")
+BRAND_COLORS = {                       # fill colour -> status
+    (0.85, 0.92, 0.83): "ok",
+    (0.96, 0.80, 0.80): "Hard Gated",
+    (0.99, 0.90, 0.80): "has path to apply",
+    (1.00, 0.90, 0.60): "has path to apply",     # "Need Approval" yellow
+}
+BRAND_STATUS_TEXTS = {"ok", "hard gated", "has path to apply", "gated", "do not sell"}
+
+
+def _status_from_color(color, tol=0.10):
+    """Nearest legend colour, so a slightly re-picked shade still resolves."""
+    best, best_d = None, tol
+    for ref, status in BRAND_COLORS.items():
+        d = max(abs(a - b) for a, b in zip(color, ref))
+        if d < best_d:
+            best, best_d = status, d
+    return best
+
+
+def fetch_brand_sheet(creds_info, sheet_id=BRAND_SHEET_ID, tab=BRAND_SHEET_TAB):
+    """Live brand matrix as a DataFrame (Brand/US/CA/UK/AU/JP/Notes). Raises on
+    failure so the caller can fall back to the bundled snapshot."""
+    from google.oauth2 import service_account            # optional dependency
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_info(
+        dict(creds_info), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    data = svc.spreadsheets().get(
+        spreadsheetId=sheet_id, ranges=[f"'{tab}'!A1:H1000"],
+        includeGridData=True, fields=("sheets/data/rowData/values/formattedValue,"
+                                      "sheets/data/rowData/values/effectiveFormat/backgroundColor")
+    ).execute()
+    rows = data["sheets"][0]["data"][0].get("rowData", [])
+    return brand_rows_to_df(rows)
+
+
+def brand_rows_to_df(rows):
+    """Sheets rowData -> matrix DataFrame. Split out so it can be tested
+    without a network call."""
+    def text(cell):
+        return str(cell.get("formattedValue", "") or "").strip()
+
+    def color(cell):
+        bg = (cell.get("effectiveFormat") or {}).get("backgroundColor") or {}
+        return tuple(round(bg.get(k, 1.0), 2) for k in ("red", "green", "blue"))
+
+    header = [text(c).upper() for c in (rows[0].get("values", []) if rows else [])]
+    cols = {}                                   # market -> column index
+    for i, h in enumerate(header):
+        for market in MATRIX_MARKETS:
+            if h.replace("AMZ", "").strip() == market:
+                cols[market] = i
+    if not cols:
+        raise ValueError(f"no market columns found in header {header!r}")
+
+    out = []
+    for row in rows[1:]:
+        cells = row.get("values", [])
+        if not cells or not text(cells[0]):
+            continue
+        rec = {"Brand": text(cells[0]), "Notes": ""}
+        notes = []
+        for market, i in cols.items():
+            cell = cells[i] if i < len(cells) else {}
+            body = text(cell)
+            status = _status_from_color(color(cell)) or ""
+            # Colour is the status; free text that isn't a status (reference
+            # ASINs, "partially hard gated") is a note, not an override.
+            if body and body.lower() not in BRAND_STATUS_TEXTS:
+                notes.append(f"{market}: {body}")
+            elif not status and body:
+                status = body
+            rec[market] = status
+        for market in MATRIX_MARKETS:
+            rec.setdefault(market, "")
+        rec["Notes"] = " · ".join(notes)
+        out.append(rec)
+    return pd.DataFrame(out, columns=["Brand"] + MATRIX_MARKETS + ["Notes"])
+
+
+def dedupe_brand_rows(df):
+    """(df, conflicts) — the sheet is hand-maintained and has the same brand
+    twice ("Paco Rabanne" / "paco rabanne", "Giorgio Armani" / "GIORGIO
+    ARMANI"), sometimes with contradictory statuses. Merge them strictest-wins:
+    a blank says nothing, but between "ok" and "Hard Gated" we take the gate.
+    Guessing permissive on a gating call is how you buy stock you can't list."""
+    severity = {"": 0, "ok": 1, "has path to apply": 2, "Hard Gated": 3, "do not sell": 3}
+    merged, order, conflicts = {}, [], []
+    for _, r in df.fillna("").iterrows():
+        brand = str(r["Brand"]).strip()
+        key = brand.casefold()
+        if key not in merged:
+            merged[key] = {"Brand": brand, "Notes": "",
+                           **{m: "" for m in MATRIX_MARKETS}}
+            order.append(key)
+        row = merged[key]
+        for m in MATRIX_MARKETS:
+            new = str(r.get(m, "")).strip()
+            old = row[m]
+            if severity.get(new, 1) > severity.get(old, 1):
+                if old and new:
+                    conflicts.append(f"{brand} {m}: {old!r} vs {new!r} → {new!r}")
+                row[m] = new
+            elif old and new and old != new:
+                conflicts.append(f"{brand} {m}: {old!r} vs {new!r} → {old!r}")
+        note = str(r.get("Notes", "")).strip()
+        if note and note not in row["Notes"]:
+            row["Notes"] = f"{row['Notes']} · {note}" if row["Notes"] else note
+    out = pd.DataFrame([merged[k] for k in order],
+                       columns=["Brand"] + MATRIX_MARKETS + ["Notes"])
+    return out, conflicts
+
+
+def apply_brand_overrides(matrix_df, overrides_df):
+    """Our own decisions layered on Amazon's gating — e.g. a brand we choose
+    not to import. Overrides win; brands not in the sheet get added."""
+    if overrides_df is None or overrides_df.empty:
+        return matrix_df
+    df = matrix_df.copy()
+    index = {}
+    for i, b in enumerate(df["Brand"]):          # every duplicate, not just one
+        index.setdefault(str(b).strip().casefold(), []).append(i)
+    for _, o in overrides_df.fillna("").iterrows():
+        brand = str(o.get("Brand", "")).strip()
+        if not brand:
+            continue
+        cells = {m: str(o.get(m, "")).strip() for m in MATRIX_MARKETS}
+        cells = {m: v for m, v in cells.items() if v}
+        note = str(o.get("Notes", "")).strip()
+        targets = index.get(brand.casefold(), [])
+        if not targets:
+            df.loc[len(df)] = {"Brand": brand, "Notes": note,
+                               **{m: cells.get(m, "") for m in MATRIX_MARKETS}}
+            continue
+        for i in targets:
+            for m, v in cells.items():
+                df.at[df.index[i], m] = v
+            if note:
+                prev = str(df.at[df.index[i], "Notes"] or "")
+                df.at[df.index[i], "Notes"] = f"{note} · {prev}" if prev else note
+    return df
+
+
+def fill_matrix_gaps(live_df, snapshot_df):
+    """(df, filled) — the sheet wins wherever it has a status, and the local
+    snapshot fills only what the sheet leaves blank. The sheet doesn't track
+    Japan at all and is missing brands we have researched ourselves, so
+    replacing the snapshot outright would throw that knowledge away; a blank
+    cell means "not recorded", not "no restriction"."""
+    if snapshot_df is None or snapshot_df.empty:
+        return live_df, 0
+    df = live_df.copy()
+    index = {str(b).strip().casefold(): i for i, b in enumerate(df["Brand"])}
+    filled = 0
+    for _, s in snapshot_df.fillna("").iterrows():
+        brand = str(s.get("Brand", "")).strip()
+        if not brand:
+            continue
+        i = index.get(brand.casefold())
+        if i is None:
+            df.loc[len(df)] = {"Brand": brand,
+                               "Notes": str(s.get("Notes", "")).strip(),
+                               **{m: str(s.get(m, "")).strip() for m in MATRIX_MARKETS}}
+            filled += 1
+            continue
+        for m in MATRIX_MARKETS:
+            val = str(s.get(m, "")).strip()
+            if val and not str(df.at[df.index[i], m] or "").strip():
+                df.at[df.index[i], m] = val
+                filled += 1
+    return df, filled
+
+
+def resolve_brand_matrix(creds_info=None, csv_path=None, overrides_path=None):
+    """(df, source) — the listing team's sheet is the source of truth, the
+    bundled snapshot fills its gaps (and stands in entirely if it is
+    unreachable), and our own exclusions win over both."""
+    df, source = None, ""
+    snapshot = None
+    if csv_path and os.path.exists(csv_path):
+        try:
+            snapshot = pd.read_csv(csv_path, dtype=str).fillna("")
+        except Exception:
+            snapshot = None
+    if creds_info:
+        try:
+            df = fetch_brand_sheet(creds_info)
+            source = f"live sheet ({len(df)} brands)"
+        except Exception as e:
+            source = f"snapshot — sheet unreachable: {e}"
+    if df is None or df.empty:
+        if snapshot is None:
+            raise FileNotFoundError(f"no brand matrix: {csv_path}")
+        df = snapshot
+        source = source or f"local snapshot ({len(df)} brands)"
+    else:
+        df, filled = fill_matrix_gaps(df, snapshot)
+        if filled:
+            source += f" + {filled} gap(s) from local snapshot"
+    df, conflicts = dedupe_brand_rows(df)
+    BRAND_CONFLICTS[:] = conflicts
+    if conflicts:
+        source += f" · {len(conflicts)} duplicate-row conflict(s) resolved strictest-wins"
+    overrides = load_brand_overrides(overrides_path)
+    if overrides is not None and not overrides.empty:
+        df = apply_brand_overrides(df, overrides)
+        source += f" + {len(overrides)} local override(s)"
+    return df.fillna(""), source
+
+BRAND_CONFLICTS = []          # last resolve's conflict detail, for the UI
+
+
+def load_brand_overrides(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return pd.read_csv(path, dtype=str).fillna("")
+    except Exception:
+        return None
+
+
 def load_shipping_table(path):
     """{(ean, market): eur_per_unit} from a csv with ean,market,cost_per_unit_eur.
     Returns {} when the file is absent — callers then use the flat rates."""
@@ -331,9 +600,307 @@ def load_shipping_table(path):
     return table
 
 
+# ─── PUBLISHING RESULTS ───────────────────────────────────────────────────────
+# Shared Drive folder for MTO analyses. The service account needs Editor on it
+# (it has that) *and* the Drive API enabled in the mto-analyzer Cloud project
+# (creating the file needs Drive; filling it only needs Sheets).
+RESULTS_FOLDER_ID = "1sXcJoxOkgqfJh-8BOP59xBJwpDwHwWqL"
+
+VERDICT_SORT = {"🟢": 0, "🟠": 1, "🔵": 2, "🔴": 3, "⚪": 4, "⚫": 5, "🚫": 6}
+
+
+def sort_for_reading(df):
+    """Decisions first, then best ROI — the order someone opening the sheet
+    wants, not the order the EANs arrived in."""
+    out = df.copy()
+    out["_o"] = out["Verdict"].fillna("").str[0].map(VERDICT_SORT).fillna(9)
+    roi_cols = [f"ROI {m}" for m in MARKETS if f"ROI {m}" in out.columns]
+    out["_r"] = out[roi_cols].max(axis=1) if roi_cols else 0
+    return out.sort_values(["_o", "_r"], ascending=[True, False]).drop(columns=["_o", "_r"])
+
+
+MARKET_NAMES = {"CA": "CANADA", "UK": "UNITED KINGDOM", "US": "UNITED STATES", "JP": "JAPAN"}
+MARKET_CURRENCY = {"CA": ("CAD", "C$"), "UK": ("GBP", "£"), "US": ("USD", "$"), "JP": ("JPY", "¥")}
+
+# One tab per decision, each split by country — the girls read these market by
+# market, and a single wide table makes them scan 40 columns to find 4 numbers.
+def sheet_tab_specs():
+    # a function, not a constant: the verdict names are defined further down
+    return [("Buy candidates", (VERDICT_BUY,)),
+            ("Ungating required", (VERDICT_SOFT,)),
+            ("Possible opportunities", (VERDICT_POSSIBLE,))]
+
+SECTION_COLUMNS = ["Brand", "Product", "EAN", "Buy (EUR)", "Sell {sym}", "ROI %",
+                   "Breakeven {sym}", "Offers", "Rank drops 30d", "Est units/mo",
+                   "Gating", "ASIN", "Why"]
+
+
+def market_sections(df, verdicts):
+    """[(market, rows_df)] for the given per-market verdicts, most promising
+    country first — most candidates, then best ROI."""
+    out = []
+    for m in MARKETS:
+        col = f"Verdict {m}"
+        if col not in df.columns:
+            continue
+        sub = df[df[col].isin(verdicts)]
+        if sub.empty:
+            continue
+        sub = sub.sort_values(f"ROI {m}", ascending=False, na_position="last")
+        out.append((m, sub))
+    return sorted(out, key=lambda kv: (-len(kv[1]), -(kv[1][f"ROI {kv[0]}"].max() or 0)))
+
+
+def _section_rows(market, sub):
+    cur, sym = MARKET_CURRENCY[market]
+    header = [c.format(sym=sym) for c in SECTION_COLUMNS]
+    rows = [[f"{MARKET_NAMES[market]} — {len(sub)} product(s)"], header]
+    for _, r in sub.iterrows():
+        def g(col):
+            v = r.get(col)
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return ""
+            return round(v, 2) if isinstance(v, float) else v
+        rows.append([
+            g("Brand"), str(r.get("Product", ""))[:70], str(r.get("EAN", "")),
+            g("Purchase (EUR)"), g(f"Sell {market} ({cur})"), g(f"ROI {market}"),
+            g(f"Breakeven {market}"), g(f"Offers {market}"), g(f"Drops30 {market}"),
+            g(f"Units {market}"), g(f"Gating {market}"), g(f"ASIN {market}"),
+            str(r.get(f"Why {market}", ""))[:90],
+        ])
+    rows.append([])
+    return rows
+
+
+NO_LISTING_COLUMNS = ["Brand", "Product", "EAN", "Buy (EUR)", "No listing on", "Notes"]
+
+
+def _no_listing_rows(df):
+    """Products nobody is selling anywhere we looked — the listings team's
+    queue, not a buying decision, so it is a flat list rather than per market."""
+    if "Status" not in df.columns:
+        return []
+    # the same definition the status lines use: no listing on ANY target
+    # market. A product listed on three markets and missing on one is not a
+    # listings job.
+    dead = df[df["Status"] == PSTATUS_NEW]
+    if dead.empty:
+        return []
+    rows = [[f"NO LISTING — {len(dead)} product(s), worth creating?"], NO_LISTING_COLUMNS]
+    for _, r in dead.iterrows():
+        missing = [m for m in MARKETS
+                   if str(r.get(f"Verdict {m}", "")) == VERDICT_DEAD]
+        rows.append([r.get("Brand", ""), str(r.get("Product", ""))[:70],
+                     str(r.get("EAN", "")),
+                     round(r["Purchase (EUR)"], 2) if pd.notna(r.get("Purchase (EUR)")) else "",
+                     ", ".join(missing), str(r.get("Notes", ""))[:90]])
+    return rows
+
+
+def build_sheet_tabs(df):
+    """{tab title: (rows, title_row_indices, header_row_indices)}"""
+    tabs = {}
+    for title, verdicts in sheet_tab_specs():
+        rows, titles, headers = [], [], []
+        for market, sub in market_sections(df, verdicts):
+            titles.append(len(rows))
+            headers.append(len(rows) + 1)
+            rows += _section_rows(market, sub)
+        # an empty tab is noise: if this offer has no buy candidates, don't
+        # make someone open a tab to find that out
+        if rows:
+            tabs[title] = (rows, titles, headers)
+
+    dead = _no_listing_rows(df)
+    if dead:
+        tabs["No listing"] = (dead, [0], [1])
+
+    # everything, for anyone who wants to check a product we filtered out
+    full = sort_for_reading(df)
+    for col in full.columns:
+        if pd.api.types.is_float_dtype(full[col]):
+            full[col] = full[col].round(2)
+    rows = [list(full.columns)] + [
+        ["" if v is None or (isinstance(v, float) and pd.isna(v)) else v for v in row]
+        for row in full.itertuples(index=False, name=None)]
+    tabs["All products"] = (rows, [], [0])
+    return tabs
+
+
+# One workbook the service account already has Editor on. Creating a NEW file
+# needs the Drive API enabled *and* a fresh share, so results go here as a tab
+# group per offer instead — no setup, no manual step, ever.
+MASTER_SHEET_ID = "1W18tFrZGcYAFVPMuSwF7uYbQKIYwTC8RYt1GycajmTU"
+KEEP_OFFERS = 24          # ~3 weekly batches; Sheets allows ~200 tabs, so the
+                          # binding limit is 10M cells, not this
+
+
+def _tab_name(offer, part):
+    """'VICTORIA'S SECRET · Buy candidates', clipped to Sheets' 100-char limit."""
+    offer = " ".join(str(offer).split())[:45]
+    return f"{offer} · {part}"
+
+
+def publish_to_master(creds_info, df, offer, master_id=MASTER_SHEET_ID,
+                      keep_offers=KEEP_OFFERS):
+    """Add this offer's tabs to the master workbook and return a link to its
+    first tab. Needs no Drive API and no new sharing."""
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_info(
+        dict(creds_info), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+    def props():
+        return [s["properties"] for s in svc.spreadsheets().get(
+            spreadsheetId=master_id, fields="sheets/properties").execute()["sheets"]]
+
+    tabs = {_tab_name(offer, part): payload
+            for part, payload in build_sheet_tabs(df).items()}
+    existing = {p["title"]: p["sheetId"] for p in props()}
+
+    reqs = [{"addSheet": {"properties": {"title": t, "index": i}}}
+            for i, t in enumerate(tabs) if t not in existing]
+    if reqs:
+        svc.spreadsheets().batchUpdate(spreadsheetId=master_id,
+                                       body={"requests": reqs}).execute()
+        existing = {p["title"]: p["sheetId"] for p in props()}
+
+    svc.spreadsheets().values().batchClear(
+        spreadsheetId=master_id, body={"ranges": [f"'{t}'" for t in tabs]}).execute()
+    svc.spreadsheets().values().batchUpdate(
+        spreadsheetId=master_id,
+        body={"valueInputOption": "RAW",
+              "data": [{"range": f"'{t}'!A1", "values": rows}
+                       for t, (rows, _, _) in tabs.items()]}).execute()
+
+    reqs = []
+    for t, (rows, titles, headers) in tabs.items():
+        sid = existing[t]
+        reqs += _format_requests(sid, rows, titles, headers)
+
+    # a re-run with fewer categories must drop the tabs it no longer produces,
+    # otherwise yesterday's empty "Buy candidates" lingers as a false negative
+    prefix = _tab_name(offer, "")
+    reqs += [{"deleteSheet": {"sheetId": sid}} for t, sid in existing.items()
+             if t.startswith(prefix) and t not in tabs]
+
+    # prune the oldest offers — tabs are ordered newest-first
+    groups, seen = [], set()
+    for p in props():
+        grp = p["title"].split(" · ")[0]
+        if grp not in seen:
+            seen.add(grp)
+            groups.append(grp)
+    for stale in groups[keep_offers:]:
+        reqs += [{"deleteSheet": {"sheetId": p["sheetId"]}} for p in props()
+                 if p["title"].startswith(f"{stale} · ")]
+    if reqs:
+        svc.spreadsheets().batchUpdate(spreadsheetId=master_id,
+                                       body={"requests": reqs}).execute()
+    first = existing[next(iter(tabs))]
+    return f"https://docs.google.com/spreadsheets/d/{master_id}/edit#gid={first}"
+
+
+def _format_requests(sid, rows, titles, headers):
+    width = max((len(r) for r in rows), default=1)
+    out = []
+    for i in titles:
+        out.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.17, "green": 0.24, "blue": 0.31},
+                "textFormat": {"bold": True, "fontSize": 11,
+                               "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
+            "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+    for i in headers:
+        out.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.91, "green": 0.94, "blue": 0.96},
+                "textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+    out.append({"autoResizeDimensions": {"dimensions": {
+        "sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width}}})
+    return out
+
+
+def publish_to_sheet(creds_info, df, title, folder_id=RESULTS_FOLDER_ID,
+                     spreadsheet_id=None):
+    """Create (or rewrite) a Google Sheet with one tab per decision, split by
+    country. Returns its URL. Raises if the service account can't create files,
+    so callers can fall back to a file upload."""
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_info(
+        dict(creds_info), scopes=["https://www.googleapis.com/auth/drive",
+                                  "https://www.googleapis.com/auth/spreadsheets"])
+    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    if spreadsheet_id is None:
+        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+        spreadsheet_id = drive.files().create(
+            body={"name": title, "parents": [folder_id],
+                  "mimeType": "application/vnd.google-apps.spreadsheet"},
+            fields="id", supportsAllDrives=True).execute()["id"]
+
+    tabs = build_sheet_tabs(df)
+    def tab_ids():
+        return {s["properties"]["title"]: s["properties"]["sheetId"]
+                for s in svc.spreadsheets().get(
+                    spreadsheetId=spreadsheet_id,
+                    fields="sheets/properties").execute()["sheets"]}
+
+    existing = tab_ids()
+
+    # add missing tabs first so we can drop whatever the file had before
+    adds = [{"addSheet": {"properties": {"title": t}}} for t in tabs if t not in existing]
+    if adds:
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
+                                       body={"requests": adds}).execute()
+        existing = tab_ids()
+    drops = [{"deleteSheet": {"sheetId": sid}} for t, sid in existing.items() if t not in tabs]
+
+    data = [{"range": f"'{t}'!A1", "values": rows} for t, (rows, _, _) in tabs.items()]
+    svc.spreadsheets().values().batchClear(
+        spreadsheetId=spreadsheet_id,
+        body={"ranges": [f"'{t}'" for t in tabs]}).execute()
+    svc.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"valueInputOption": "RAW", "data": data}).execute()
+
+    reqs = list(drops)
+    for t, (rows, titles, headers) in tabs.items():
+        sid = existing[t]
+        width = max((len(r) for r in rows), default=1)
+        for i in titles:
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": {"red": 0.17, "green": 0.24, "blue": 0.31},
+                    "textFormat": {"bold": True, "fontSize": 11,
+                                   "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
+                "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+        for i in headers:
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": {"red": 0.91, "green": 0.94, "blue": 0.96},
+                    "textFormat": {"bold": True}}},
+                "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+        reqs.append({"autoResizeDimensions": {"dimensions": {
+            "sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": width}}})
+    if reqs:
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
+                                       body={"requests": reqs}).execute()
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+
+
 # ─── KEEPA CLIENT ─────────────────────────────────────────────────────────────
 
 IDX_SALES_RANK = 3      # stats array index: sales rank
+IDX_BB_OOS = 18         # out-of-stock array index: Buy Box (100 = no Buy Box at all)
 IDX_NEW = 1             # stats array index: NEW price
 IDX_BUY_BOX = 18        # stats array index: buy box incl. shipping
 BATCH_SIZE = 100
@@ -374,11 +941,47 @@ def stat_rank(stats, arr_name, idx):
     return None
 
 
+def _oos_to_bb_days(stats, key="outOfStockPercentage30"):
+    """% of the last 30 days that had a Buy Box. Keepa reports out-of-stock
+    percentage per price type; -1 means no data."""
+    arr = (stats or {}).get(key) or []
+    if len(arr) > IDX_BB_OOS and arr[IDX_BB_OOS] >= 0:
+        return round(100 - arr[IDX_BB_OOS])
+    return None
+
+
 def extract_product(p, price_divisor=100):
-    """Reduce a Keepa product object to the fields we need."""
+    """Reduce a Keepa product object to the fields we need.
+
+    Beyond price and rank this captures the signals the repricing team reads
+    off the Keepa chart by hand (Rita's 'Reading Keepa for Order Quantities'):
+    who is actually selling, whether a Buy Box exists, and how often the rank
+    drops — a rank drop is a sale, so it is the velocity proxy.
+    """
     stats = p.get("stats") or {}
     fba = (p.get("fbaFees") or {}).get("pickAndPackFee")
+
+    def stat_num(key):
+        v = stats.get(key)
+        return v if isinstance(v, (int, float)) and v >= 0 else None
+
+    bb_price = stats.get("buyBoxPrice")
     return {
+        # --- what is actually being sold right now -----------------------
+        # Offers and Buy Box are checked BEFORE rank: Amazon keeps updating the
+        # rank of listings nobody sells, so rank alone invents demand.
+        "offers": stat_num("totalOfferCount"),
+        "offers_fba": stat_num("offerCountFBA"),      # needs the offers param
+        "bb_now": bb_price / price_divisor if isinstance(bb_price, (int, float)) and bb_price > 0 else None,
+        "bb_is_fba": stats.get("buyBoxIsFBA"),
+        "bb_is_amazon": stats.get("buyBoxIsAmazon"),
+        "bb_days_30": _oos_to_bb_days(stats),         # % of last 30d with a Buy Box
+        # --- demand ------------------------------------------------------
+        "rank_drops_30": stat_num("salesRankDrops30"),
+        "rank_drops_90": stat_num("salesRankDrops90"),
+        "monthly_sold": p.get("monthlySold"),         # the "N+ bought" badge
+        # --- identity risk ------------------------------------------------
+        "n_barcodes": len(p.get("eanList") or []),
         # Real per-product FBA fee in marketplace currency. A flat sidebar
         # default cannot know a product's size/weight band; this can.
         "fba_fee": fba / price_divisor if fba else None,
@@ -590,9 +1193,116 @@ def items_from_excel(data_or_path, default_brand=""):
     return items, skipped, report
 
 
+ROI_THRESHOLD = 17.0   # % — an "opportunity" needs at least this ROI
+
+# ─── DEMAND / SELLABILITY (Rita's "Reading Keepa for Order Quantities") ───────
+# Order of checks is fixed: offers and Buy Box FIRST, rank SECOND. Amazon keeps
+# updating the rank of listings nobody sells, so reading demand off the rank of
+# a dead listing invents it.
+
+# The positive verdicts are split by whether we may actually sell the brand on
+# that market: a great ROI on a brand we cannot list is not an opportunity, and
+# a brand missing from the matrix is a lead, not a decision.
+VERDICT_BUY = "🟢 buy candidate"                       # brand ungated on that market
+VERDICT_SOFT = "🟠 buy candidate — ungating required"  # soft-gated, path to apply
+VERDICT_POSSIBLE = "🔵 possible opportunity — gating unknown"
+VERDICT_OPEN = "open field — we would set the price"
+VERDICT_NO_DEMAND = "🔴 no demand"
+VERDICT_PRICE_GAP = "🔴 sells, but not at a price that pays"
+VERDICT_DEAD = "⚫ nobody selling"
+VERDICT_LOW_ROI = "⚪ below ROI bar"
+VERDICT_GATED = "🚫 gated"
+VERDICT_NO_SELL = "🚫 we do not sell this brand"
+
+
+def breakeven_sell(market, p_eur, P, is_dg=True, roi_target=None, fba_fee=None):
+    """The sell price (market currency) at which ROI hits the bar — 'the price
+    needed for 17% is only C$42.40'. Solved numerically so it stays correct for
+    whatever each market's formula does."""
+    roi_target = (ROI_THRESHOLD if roi_target is None else roi_target) / 100
+    cfg = MARKETS[market]
+    P = dict(P)
+    if fba_fee is not None and cfg.get("fba_key"):
+        P[cfg["fba_key"]] = fba_fee
+    calc = cfg["calc"]
+    lo, hi = 0.01, max(p_eur * 60, 1000.0)
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if calc(p_eur, mid, P, is_dg) < roi_target:
+            lo = mid
+        else:
+            hi = mid
+    return round(hi, 2)
+
+
+def _positive_verdict(gate_rank):
+    """Which flavour of 'worth buying' applies, given what we know about gating."""
+    return {GATE_OK: VERDICT_BUY, GATE_APPLY: VERDICT_SOFT}.get(gate_rank, VERDICT_POSSIBLE)
+
+
+def market_verdict(d, roi, gate_rank, roi_threshold=ROI_THRESHOLD, gate_label=None):
+    """(verdict, est_units_per_month, note) for one product on one market.
+
+    d is the extracted Keepa record; roi is the computed ROI %; gate_rank the
+    gating level. Follows the fixed order: gated → selling? → demand? → money?
+    """
+    if gate_rank == GATE_HARD:
+        # "we chose not to" and "Amazon won't let us" both stop the buy, but
+        # only one of them is worth appealing — say which.
+        if gate_label == GATE_NO_SELL_LABEL:
+            return VERDICT_NO_SELL, None, ""
+        return VERDICT_GATED, None, ""
+    if not d:
+        return VERDICT_DEAD, None, "no listing found"
+
+    offers = d.get("offers")
+    bb_days = d.get("bb_days_30")
+    drops30, drops90 = d.get("rank_drops_30"), d.get("rank_drops_90")
+
+    # 1. is anyone selling at all?
+    nobody_selling = (offers in (0, None)) and (bb_days in (0, None))
+    # 2. is anyone buying? (a rank drop is a sale)
+    no_demand = (drops30 == 0 and (drops90 or 0) == 0)
+
+    # Our share divides by FULFILMENT competitors, not by every offer: a
+    # listing whose Buy Box is held by a distance seller hands us the market,
+    # because fulfilment normally takes the box from a distance seller at a
+    # comparable price. That is the optimistic end, so quote both (Rita §7.6).
+    units = d.get("monthly_sold") or drops30
+    fba_n = d.get("offers_fba")
+    if fba_n is None:
+        # exact FBA count needs the pricier offers call; infer from who holds
+        # the box — no FBA Buy Box and no FBA data means no fulfilment rival
+        fba_n = (offers or 0) if d.get("bb_is_fba") else 0
+    share = units / (fba_n + 1) if units is not None else None
+    cautious = round(share / 2, 1) if (share and not fba_n and offers) else None
+
+    if nobody_selling:
+        if no_demand:
+            return VERDICT_DEAD, None, "no offers and no sales history"
+        # Nobody is selling, so we would set the price — but the only evidence
+        # of demand is the price it actually sold at. If the return there is
+        # below the bar, real demand and a workable price do not overlap.
+        if roi is not None and roi < roi_threshold:
+            return (VERDICT_PRICE_GAP, share,
+                    f"sold {units}/mo with nobody selling now, but only "
+                    f"{roi:.0f}% ROI at the price it sold at")
+        return (_positive_verdict(gate_rank), share,
+                f"{VERDICT_OPEN}; confirm the price it actually sold at still "
+                f"clears the bar")
+    if no_demand:
+        return VERDICT_NO_DEMAND, 0, f"{offers or 0} offer(s) but no rank drops in 90 days"
+    if roi is None or roi < roi_threshold:
+        return VERDICT_LOW_ROI, share, ""
+    return (_positive_verdict(gate_rank), share,
+            f"{units}/mo market, {offers or 0} offer(s)"
+            + ("" if bb_days is None else f", Buy Box {bb_days}% of 30d")
+            + ("" if cautious is None else
+               f" — box held by a distance seller, cautious estimate {cautious}/mo"))
+
+
 # ─── STATUS CLASSIFICATION ────────────────────────────────────────────────────
 
-ROI_THRESHOLD = 17.0   # % — an "opportunity" needs at least this ROI
 
 # Per-product labels (Status column)
 PSTATUS_EXISTING = "🟢 opportunity"
@@ -716,9 +1426,12 @@ def build_fetch_plan(items, matrix, skip_hard_gated=True):
     return plan, skipped
 
 
-RESULT_COLUMNS = (["Product", "Brand", "EAN", "Purchase (EUR)", "Status"]
+RESULT_COLUMNS = (["Product", "Brand", "EAN", "Purchase (EUR)", "Status",
+                   "Verdict", "Why", "Est units/mo"]
                   + [f"{field} {m}" for m in MARKETS
-                     for field in ("ASIN", "Sell", "Rank", "ROI", "Gating")]
+                     for field in ("ASIN", "Sell", "Breakeven", "ROI", "Gating",
+                                   "Offers", "BB days", "Drops30", "Verdict",
+                                   "Why", "Units")]
                   + ["Notes"])
 
 
@@ -735,15 +1448,22 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
         row = {"Product": it["title"], "EAN": it["ean"],
                "Purchase (EUR)": round(it["price_eur"], 2)}
         notes = []
+        verdicts = {}
 
+        # Brand resolution order: the offer's own brand if the matrix knows it,
+        # otherwise Keepa's. Big multi-brand offers label every row with the
+        # offer name ("PERFUMES & SKINCARE"), which tells us nothing about
+        # gating — Keepa's brand for the matched ASIN does.
         brand = it.get("brand") or None
         keepa_title = ""
-        if not brand:
-            for market in MARKETS:
-                d = market_data.get(market, {}).get(it["ean"])
-                if d and d.get("brand"):
-                    brand = d["brand"]
-                    break
+        keepa_brand = None
+        for market in MARKETS:
+            d = market_data.get(market, {}).get(it["ean"])
+            if d and d.get("brand"):
+                keepa_brand = d["brand"]
+                break
+        if keepa_brand and (not brand or gating_for_brand(matrix, brand) is None):
+            brand = keepa_brand
         row["Brand"] = brand
         gating = gating_for_brand(matrix, brand)
         if gating is not None and brand and norm_brand(brand) != norm_brand(gating["display"]):
@@ -755,7 +1475,7 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
                 gate_ranks[market] = GATE_CHECK
             else:
                 gate_ranks[market] = gating[market]
-                row[f"Gating {market}"] = GATE_LABELS[gating[market]]
+                row[f"Gating {market}"] = gating.get(f"{market}_label") or GATE_LABELS[gating[market]]
             row[f"_gate_{market}"] = gate_ranks[market]
         row["_gate"] = min(gate_ranks.values())
 
@@ -787,40 +1507,69 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
                     notes.append(f"{market}: {d['n_matches']} ASINs matched")
                 if not it["title"] and d.get("title"):
                     row["Product"] = d["title"]
+            # Per-product cost inputs, built whether or not we have a sell
+            # price — the break-even price needs them too.
+            P_market = P
+            fba_key = cfg.get("fba_key")
+            if fba_key and d and d.get("fba_fee"):
+                P_market = {**P, fba_key: d["fba_fee"]}
+            elif fba_key and d and sell is not None:
+                notes.append(f"{market}: FBA fee is the flat default")
+            ship_key = cfg.get("ship_key")
+            if ship_key:
+                real_ship = shipping_table.get((it["ean"], market))
+                if real_ship is not None:
+                    P_market = {**P_market, ship_key: real_ship}
+                elif shipping_table and sell is not None:
+                    notes.append(f"{market}: freight is the flat default "
+                                 f"({P[ship_key]:.2f} EUR)")
+            customs_key = cfg.get("customs_key")
+            if customs_key:
+                real_customs = customs_table.get((it["ean"], market))
+                if real_customs:
+                    P_market = {**P_market, customs_key: real_customs}
             if sell is not None:
-                # Prefer the product's real FBA fee; fall back to the flat
-                # parameter when Keepa has none (or a pre-v5 cache entry).
-                P_market = P
-                fba_key = cfg.get("fba_key")
-                if fba_key and d and d.get("fba_fee"):
-                    P_market = {**P, fba_key: d["fba_fee"]}
-                elif fba_key and d:
-                    notes.append(f"{market}: FBA fee is the flat default")
-                # this product's own freight beats the market average
-                ship_key = cfg.get("ship_key")
-                if ship_key:
-                    real_ship = shipping_table.get((it["ean"], market))
-                    if real_ship is not None:
-                        P_market = {**P_market, ship_key: real_ship}
-                    elif shipping_table:
-                        notes.append(f"{market}: freight is the flat default "
-                                     f"({P[ship_key]:.2f} EUR)")
-                customs_key = cfg.get("customs_key")
-                if customs_key:
-                    real_customs = customs_table.get((it["ean"], market))
-                    if real_customs:
-                        P_market = {**P_market, customs_key: real_customs}
                 roi = round(calc(it["price_eur"], sell, P_market, is_dg) * 100, 1)
             row[f"ASIN {market}"] = asin
             row[f"Sell {market} ({cur})"] = round(sell, 2) if sell is not None else None
             row[f"Sell {market}"] = row[f"Sell {market} ({cur})"]
             row[f"Rank {market}"] = rank
             row[f"ROI {market}"] = roi
+            # what the repricing team reads off the Keepa chart by hand
+            row[f"Offers {market}"] = (d or {}).get("offers")
+            row[f"BB days {market}"] = (d or {}).get("bb_days_30")
+            row[f"Drops30 {market}"] = (d or {}).get("rank_drops_30")
+            row[f"Breakeven {market}"] = (
+                breakeven_sell(market, it["price_eur"], P_market, is_dg,
+                               fba_fee=(d or {}).get("fba_fee"))
+                if (it["ean"], market) not in skipped_pairs and gate_ranks[market] != GATE_HARD
+                else None)
+            verdicts[market] = market_verdict(
+                d, roi, gate_ranks[market],
+                gate_label=(gating or {}).get(f"{market}_label"))
+            # kept per market so results can be split by country downstream
+            row[f"Verdict {market}"] = verdicts[market][0]
+            row[f"Why {market}"] = verdicts[market][2]
+            row[f"Units {market}"] = (round(verdicts[market][1], 1)
+                                      if verdicts[market][1] else None)
 
         if gating is not None and gating.get("note"):
             notes.append(f"Matrix: {gating['note']}")
         row["Notes"] = "; ".join(notes)
         row["Status"] = product_status(row)
+
+        # one verdict per product: the best market wins, and says which
+        order = [VERDICT_BUY, VERDICT_SOFT, VERDICT_POSSIBLE, VERDICT_LOW_ROI,
+                 VERDICT_PRICE_GAP, VERDICT_NO_DEMAND, VERDICT_DEAD, VERDICT_GATED,
+                 VERDICT_NO_SELL]
+        best = min(verdicts.items(), key=lambda kv: order.index(kv[1][0])) if verdicts else None
+        if best:
+            market, (verdict, units, why) = best
+            row["Verdict"] = (f"{verdict} ({market})"
+                              if verdict in (VERDICT_BUY, VERDICT_SOFT, VERDICT_POSSIBLE)
+                              else verdict)
+            row["Why"] = why
+            row["Est units/mo"] = round(units, 1) if units else None
         rows.append(row)
 
     result_df = pd.DataFrame(rows)
@@ -854,21 +1603,54 @@ def build_result_df(items, market_data, matrix, params, skipped_pairs=None,
 
 def analyze(items, keepa_key, params=None, matrix_df=None, cache_path=None,
             cache_hours=24, progress=None, skip_hard_gated=True, buybox=True,
-            shipping_path=None, shipping_creds=None):
+            shipping_path=None, shipping_creds=None, two_pass=True):
     """End-to-end: gating pre-check → Keepa fetch → ranked result table.
 
     Returns dict with result_df, market_data, skipped_pairs, tokens_left,
     fetched (per-market fetch counts)."""
     progress = progress or (lambda msg: None)
     matrix = matrix_from_df(matrix_df)
+    infer_brands(items, matrix)      # supplier titles lead with the brand
     plan, skipped_pairs = build_fetch_plan(items, matrix, skip_hard_gated)
     cache = load_cache(cache_path)
     market_data, tokens_left = {}, None
+
+    # Pass 1 is deliberately the cheap call (1 token vs 3). It already answers
+    # the two questions that eliminate most products — is anyone selling
+    # (offer count) and is anyone buying (rank drops) — so Buy Box data is only
+    # bought for the few rows that survive. Same order of checks a human uses,
+    # applied to the token budget.
+    first_pass_buybox = buybox and not two_pass
     for market, eans in plan.items():
         market_data[market], tl = fetch_market(keepa_key, market, eans, cache,
-                                               cache_hours, progress, cache_path, buybox)
+                                               cache_hours, progress, cache_path,
+                                               first_pass_buybox)
         if tl is not None:
             tokens_left = tl
+
+    if buybox and two_pass:
+        triage = build_result_df(items, market_data, matrix, params, skipped_pairs)
+        roi_bar = (params or {}).get("roi_threshold", ROI_THRESHOLD)
+        wanted = {m: [] for m in MARKETS}
+        for _, r in triage.iterrows():
+            for m in MARKETS:
+                roi = r.get(f"ROI {m}")
+                d = market_data.get(m, {}).get(str(r["EAN"]))
+                promising = (roi is not None and pd.notna(roi) and roi >= roi_bar)
+                open_field = bool(d) and not d.get("offers") and (d.get("rank_drops_90") or 0) > 0
+                if promising or open_field:
+                    wanted[m].append(str(r["EAN"]))
+        n = sum(len(v) for v in wanted.values())
+        progress(f"triage: {n} of {sum(len(v) for v in plan.values())} lookups worth "
+                 f"Buy Box detail ({n * 2} extra tokens)")
+        for market, eans in wanted.items():
+            if not eans:
+                continue
+            detail, tl = fetch_market(keepa_key, market, eans, cache, cache_hours,
+                                      progress, cache_path, True)
+            market_data[market].update({k: v for k, v in detail.items() if v})
+            if tl is not None:
+                tokens_left = tl
     shipping_table, customs_table, shipping_source = resolve_shipping_table(
         shipping_creds, shipping_path)
     progress(f"freight: {shipping_source}")
